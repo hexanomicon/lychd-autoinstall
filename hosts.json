@@ -1,0 +1,46 @@
+{
+  "pins": {
+    "lychd_source_revision": "490dd05760b545e668ad449cd85352efadc0a688",
+    "lychd_source_python": "3.14.8",
+    "lychd_uv_sha256": "3e801df892439f5cde65d8b51ea69b69abff199ef37cc3cae4481be15d592df0",
+    "lychd_uv_tgz_sha256": "1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154",
+    "lychd_image_url": "https://github.com/hexanomicon/lychd-autoinstall/releases/download/image-490dd057/lychd-490dd05760b545e668ad449cd85352efadc0a688.oci.tar",
+    "lychd_image_archive_sha256": "f96bd55338fb5351d8de54c6f50428381a6067ae0e61991d711b93e862fb9a5f",
+    "lychd_image_id": "d73fde71ff11ef6406cfb3afdbe83862c3c99d6d0978107db17d86d0d4bbd858"
+  },
+  "runtime_keys": [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG7sB6xoBhaxlxzv+2Cwowskyks8s+cutgsbLmnKXU2c lychd-deployment-controller"
+  ],
+  "packages": [
+    "ansible-core",
+    "python313-selinux",
+    "python314-selinux",
+    "podman",
+    "container-selinux",
+    "selinux-policy-targeted",
+    "policycoreutils",
+    "git-core",
+    "acl",
+    "shadow-pw-mgmt",
+    "openssh-server",
+    "openssh-clients",
+    "firewalld",
+    "btrfsprogs",
+    "snapper",
+    "sudo",
+    "curl",
+    "NetworkManager",
+    "qemu-guest-agent"
+  ],
+  "hosts": {
+    "debayan": {
+      "admin_user": "debayan",
+      "admin_keys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG7sB6xoBhaxlxzv+2Cwowskyks8s+cutgsbLmnKXU2c lychd-deployment-controller"
+      ],
+      "boot": "bios",
+      "disk": "/dev/vda"
+    }
+  },
+  "tw_repo": "https://download.opensuse.org/history/20261111/tumbleweed/repo/oss"
+}

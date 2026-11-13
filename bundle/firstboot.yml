@@ -1,0 +1,361 @@
+# Runs once, as root, on the first boot of a freshly auto-installed Tumbleweed host.
+# Same steps and pins as deployments/ansible (tumbleweed_host, lychd_source, lychd_image,
+# lychd_app), collapsed into one local run because the machine is known to be blank.
+- name: Provision LychD on a freshly installed Tumbleweed host
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_pipelining: true
+    rev: "{{ lychd_source_revision }}"
+    src: "/home/lychd/src/lychd-{{ lychd_source_revision }}"
+    cli: "/home/lychd/src/lychd-{{ lychd_source_revision }}/.venv/bin/lychd"
+    tools: /home/lychd/.local/lib/lychd-tools
+    uv: /home/lychd/.local/lib/lychd-tools/uv-0.13.0
+    image_ref: "localhost/lychd:{{ lychd_source_revision }}"
+    staging: /home/lychd/.local/state/lychd-deploy
+    archive: "/home/lychd/.local/state/lychd-deploy/lychd-{{ lychd_source_revision }}.oci.tar"
+    lychd_env:
+      HOME: /home/lychd
+      XDG_RUNTIME_DIR: /run/user/1001
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1001/bus
+      PYTHONDONTWRITEBYTECODE: '1'
+    floor_packages: [podman, git-core, python3, shadow, acl, shadow-pw-mgmt, openssh-clients,
+                     openssh-server, firewalld, btrfsprogs, snapper, policycoreutils, sudo, curl]
+  tasks:
+    - name: Require pinned inputs
+      ansible.builtin.assert:
+        that:
+          - rev is match('^[0-9a-f]{40}$')
+          - lychd_uv_sha256 is match('^[0-9a-f]{64}$')
+          - lychd_uv_tgz_sha256 is match('^[0-9a-f]{64}$')
+          - admin_user is match('^[a-z_][a-z0-9_-]*$') and admin_user != 'lychd'
+          - lychd_runtime_ssh_public_keys | length > 0
+
+    # ---------------------------------------------------------------- host floor
+    - name: Install missing floor packages
+      ansible.builtin.shell: |
+        missing=""
+        for p in {{ floor_packages | join(' ') }}; do rpm -q --whatprovides "$p" >/dev/null || missing="$missing $p"; done
+        [ -z "$missing" ] && echo none && exit 0
+        zypper --non-interactive install --no-recommends -- $missing
+      register: floor_install
+      changed_when: "'none' not in floor_install.stdout"
+
+    - name: Require SELinux enforcing on Btrfs root
+      ansible.builtin.shell: getenforce && findmnt -no FSTYPE /
+      register: floor_checks
+      changed_when: false
+      failed_when: floor_checks.stdout_lines != ['Enforcing', 'btrfs']
+
+    # Stock TW sudoers has `Defaults targetpw` + `ALL ALL=(ALL) ALL`, which would hand lychd sudo.
+    - name: Write /etc/sudoers from the vendor copy without the targetpw/ALL lines
+      ansible.builtin.shell: |
+        set -e
+        vendor=/usr/etc/sudoers; [ -f "$vendor" ] || vendor=/etc/sudoers
+        sed -E 's/^(Defaults[[:space:]]+targetpw)/# \1/; s/^(ALL[[:space:]]+ALL=\(ALL\)[[:space:]]+ALL)/# \1/' "$vendor" > /etc/sudoers.new
+        grep -q '^@includedir /etc/sudoers.d' /etc/sudoers.new || echo '@includedir /etc/sudoers.d' >> /etc/sudoers.new
+        visudo -cf /etc/sudoers.new
+        install -m 0440 -o root -g root /etc/sudoers.new /etc/sudoers && rm -f /etc/sudoers.new
+      changed_when: true
+
+    - name: Give the administrator passwordless sudo (login is SSH-key only)
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-{{ admin_user }}"
+        content: "{{ admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        mode: '0440'
+        validate: visudo -cf %s
+
+    - name: Keep sshd key-only with no root login
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/50-lychd-host.conf
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+        mode: '0644'
+      register: sshd_conf
+
+    - name: Enable sshd and firewalld; allow only SSH inbound
+      ansible.builtin.shell: |
+        systemctl enable --now sshd firewalld
+        firewall-cmd --permanent --zone=public --add-service=ssh
+        firewall-cmd --reload
+        {% if sshd_conf.changed %}systemctl reload sshd{% endif %}
+      changed_when: true
+
+    - name: Runtime group
+      ansible.builtin.group:
+        name: lychd
+        gid: 1001
+
+    - name: Empty root-owned skeleton (TW useradd otherwise copies /usr/etc/skel)
+      ansible.builtin.file:
+        path: /etc/lychd-host-floor-empty-skel
+        state: directory
+        mode: '0700'
+
+    - name: Runtime account without sudo or password, no implicit subids
+      ansible.builtin.command:
+        argv: [/usr/sbin/useradd, --uid, '1001', --gid, '1001', --home-dir, /home/lychd, --create-home,
+               --skel, /etc/lychd-host-floor-empty-skel, --shell, /bin/bash, --password, '*',
+               --key, SUB_UID_COUNT=0, --key, SUB_GID_COUNT=0, lychd]
+        creates: /home/lychd
+
+    - name: Subordinate ID ranges
+      ansible.builtin.lineinfile:
+        path: "/etc/{{ item }}"
+        line: "lychd:231072:65536"
+        create: true
+        mode: '0644'
+      loop: [subuid, subgid]
+
+    - name: Runtime SSH directory
+      ansible.builtin.file:
+        path: /home/lychd/.ssh
+        state: directory
+        owner: lychd
+        group: lychd
+        mode: '0700'
+
+    - name: Runtime SSH keys
+      ansible.builtin.copy:
+        dest: /home/lychd/.ssh/authorized_keys
+        content: "{{ lychd_runtime_ssh_public_keys | join('\n') }}\n"
+        owner: lychd
+        group: lychd
+        mode: '0600'
+
+    - name: Private home and SSH labels
+      ansible.builtin.shell: |
+        chown lychd:lychd /home/lychd/.ssh && chmod 0700 /home/lychd /home/lychd/.ssh
+        restorecon -Rv /home/lychd/.ssh
+      changed_when: false
+
+    - name: Pull network-online.target into boot (rootless podman wait service)
+      ansible.builtin.file:
+        src: /usr/lib/systemd/system/network-online.target
+        dest: /etc/systemd/system/multi-user.target.wants/network-online.target
+        state: link
+
+    - name: Modest snapper retention
+      ansible.builtin.lineinfile:
+        path: /etc/snapper/configs/root
+        regexp: '^\s*{{ item.key }}\s*='
+        line: '{{ item.key }}="{{ item.value }}"'
+      loop:
+        - {key: TIMELINE_CREATE, value: 'no'}
+        - {key: NUMBER_CLEANUP, value: 'yes'}
+        - {key: NUMBER_LIMIT, value: '6'}
+        - {key: NUMBER_LIMIT_IMPORTANT, value: '2'}
+
+    - name: Enable linger and wait for the user manager bus
+      ansible.builtin.shell: |
+        loginctl enable-linger lychd
+        for i in $(seq 1 60); do [ -S /run/user/1001/bus ] && exit 0; sleep 1; done
+        exit 1
+      changed_when: true
+
+    # ---------------------------------------------------------------- source CLI
+    - name: Private tool and state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: lychd
+        group: lychd
+        mode: '0700'
+      loop: [/home/lychd/.local, /home/lychd/.local/lib, "{{ tools }}", /home/lychd/.local/state, "{{ staging }}", /home/lychd/src]
+
+    - name: Official uv 0.13.0 release tarball (pinned SHA-256)
+      ansible.builtin.get_url:
+        url: https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-unknown-linux-gnu.tar.gz
+        dest: /var/lib/lychd-firstboot/uv-0.13.0.tar.gz
+        checksum: "sha256:{{ lychd_uv_tgz_sha256 }}"
+        mode: '0644'
+
+    - name: Install the uv binary and require its pinned SHA-256
+      ansible.builtin.shell: |
+        set -e
+        tar -xzf /var/lib/lychd-firstboot/uv-0.13.0.tar.gz -C /var/lib/lychd-firstboot
+        echo "{{ lychd_uv_sha256 }}  /var/lib/lychd-firstboot/uv-x86_64-unknown-linux-gnu/uv" | sha256sum -c -
+        install -o lychd -g lychd -m 0755 /var/lib/lychd-firstboot/uv-x86_64-unknown-linux-gnu/uv {{ uv }}
+      args:
+        creates: "{{ uv }}"
+
+    - name: Run the source and image steps as lychd
+      become: true
+      become_user: lychd
+      become_method: sudo
+      environment: "{{ lychd_env }}"
+      block:
+        - name: Clone the exact revision
+          ansible.builtin.git:
+            repo: https://github.com/hexanomicon/lychd.git
+            dest: "{{ src }}"
+            version: "{{ rev }}"
+            update: false
+          environment:
+            GIT_CONFIG_NOSYSTEM: '1'
+            GIT_TERMINAL_PROMPT: '0'
+
+        - name: Install the locked CLI
+          ansible.builtin.command:
+            argv: ["{{ uv }}", --no-config, sync, --locked, --no-dev, --extra, postgres-binary,
+                   --python, "{{ lychd_source_python }}", --managed-python]
+            chdir: "{{ src }}"
+            creates: "{{ cli }}"
+          environment:
+            UV_PYTHON_DOWNLOADS: automatic
+            UV_PYTHON_INSTALL_MIRROR: https://github.com/astral-sh/python-build-standalone/releases/download
+            UV_PYTHON_INSTALL_DIR: "{{ tools }}/python"
+            UV_CACHE_DIR: "{{ tools }}/cache"
+            UV_DEFAULT_INDEX: https://pypi.org/simple
+            UV_PROJECT_ENVIRONMENT: "{{ src }}/.venv"
+
+        - name: Observe whether the image is already present
+          ansible.builtin.command:
+            argv: [podman, image, inspect, "{{ image_ref }}", --format, "{{ '{{' }}.Id{{ '}}' }}"]
+          register: image_before
+          changed_when: false
+          failed_when: false
+
+        # One published archive per revision, so every host runs the identical image ID.
+        - name: Load the published image archive
+          when: image_before.rc != 0 and lychd_image_url | default('') | length > 0
+          block:
+            - name: Download the archive with its pinned SHA-256
+              ansible.builtin.get_url:
+                url: "{{ lychd_image_url }}"
+                dest: "{{ archive }}"
+                checksum: "sha256:{{ lychd_image_archive_sha256 }}"
+                mode: '0600'
+                timeout: 600
+
+            - name: Load into rootless storage
+              ansible.builtin.command:
+                argv: [podman, load, --input, "{{ archive }}"]
+              changed_when: true
+
+            - name: Tag by full revision if the archive carried no tag
+              ansible.builtin.shell: |
+                podman image inspect {{ image_ref }} >/dev/null 2>&1 || podman tag {{ lychd_image_id }} {{ image_ref }}
+              changed_when: true
+
+            - name: Remove the staged archive
+              ansible.builtin.file:
+                path: "{{ archive }}"
+                state: absent
+
+        # Fallback when no archive is published: runbook build shape from the pinned checkout.
+        - name: Build the image from the pinned checkout
+          ansible.builtin.command:
+            argv: [podman, build, --file, Containerfile, --build-arg, "VCS_REF={{ rev }}", --tag, "{{ image_ref }}", .]
+            chdir: "{{ src }}"
+          when: image_before.rc != 0 and lychd_image_url | default('') | length == 0
+          changed_when: true
+
+        - name: Require the pinned revision label (and exact ID when an archive is pinned)
+          ansible.builtin.command:
+            argv: [podman, image, inspect, "{{ image_ref }}", --format,
+                   "{{ '{{' }}.Id{{ '}}' }} {{ '{{' }}index .Labels \"org.opencontainers.image.revision\"{{ '}}' }}"]
+          register: image_final
+          changed_when: false
+          failed_when: >-
+            image_final.stdout.split()[-1] != rev or
+            (lychd_image_id | default('') | length > 0 and image_final.stdout.split()[0] != lychd_image_id)
+
+        # ------------------------------------------------------------ application
+        - name: Classify the application
+          ansible.builtin.command:
+            argv: [/usr/bin/python3, -I, /var/lib/lychd-firstboot/bundle/files/app_probe.py, classify]
+            stdin: "{{ {'revision': rev} | to_json }}"
+          register: classify0
+          changed_when: false
+
+        - name: Initialize when absent
+          when: (classify0.stdout | from_json).state == 'absent'
+          block:
+            - name: Preview initialization
+              ansible.builtin.command:
+                argv: ["{{ cli }}", init, --dry-run]
+                chdir: "{{ src }}"
+              register: init_plan
+              changed_when: false
+              failed_when: "'Initialization plan is safe' not in init_plan.stdout"
+
+            - name: Initialize
+              ansible.builtin.command:
+                argv: ["{{ cli }}", init]
+                chdir: "{{ src }}"
+              changed_when: true
+
+        - name: Classify after init
+          ansible.builtin.command:
+            argv: [/usr/bin/python3, -I, /var/lib/lychd-firstboot/bundle/files/app_probe.py, classify]
+            stdin: "{{ {'revision': rev} | to_json }}"
+          register: classify1
+          changed_when: false
+
+        - name: Configure the image line and bind
+          when: (classify1.stdout | from_json).state == 'initialized'
+          block:
+            - name: Set [server.web] image to the admitted revision tag
+              ansible.builtin.command:
+                argv: [/usr/bin/python3, -I, /var/lib/lychd-firstboot/bundle/files/app_probe.py, configure]
+                stdin: "{{ {'revision': rev, 'image_ref': image_ref} | to_json }}"
+              changed_when: true
+
+            - name: Preview binding
+              ansible.builtin.command:
+                argv: ["{{ cli }}", bind, --dry-run]
+                chdir: "{{ src }}"
+              changed_when: false
+
+            - name: Bind
+              ansible.builtin.command:
+                argv: ["{{ cli }}", bind]
+                chdir: "{{ src }}"
+              changed_when: true
+
+        - name: Classify after bind
+          ansible.builtin.command:
+            argv: [/usr/bin/python3, -I, /var/lib/lychd-firstboot/bundle/files/app_probe.py, classify]
+            stdin: "{{ {'revision': rev} | to_json }}"
+          register: classify2
+          changed_when: false
+          failed_when: (classify2.stdout | from_json).state not in ['bound_inactive', 'running']
+
+        - name: Start
+          ansible.builtin.command:
+            argv: ["{{ cli }}", start]
+            chdir: "{{ src }}"
+          when: (classify2.stdout | from_json).state == 'bound_inactive'
+          changed_when: true
+
+        - name: Wait for the owned units
+          ansible.builtin.command:
+            argv: [systemctl, --user, is-active, lychd-pod.service, lychd-phylactery.service,
+                   lychd-reactor.path, lychd-vessel.service]
+          register: units
+          until: units.rc == 0
+          retries: 36
+          delay: 10
+          changed_when: false
+
+        - name: Acceptance checks (same probe as app-verify.yml)
+          ansible.builtin.command:
+            argv: [/usr/bin/python3, -I, /var/lib/lychd-firstboot/bundle/files/app_probe.py, verify]
+            stdin: "{{ {'revision': rev, 'image_id': lychd_image_id | default('')} | to_json }}"
+          register: acceptance
+          changed_when: false
+
+    - name: Record acceptance evidence
+      ansible.builtin.copy:
+        dest: /var/lib/lychd-firstboot/acceptance.json
+        content: "{{ acceptance.stdout }}\n"
+        mode: '0644'
+
+    - name: Require every acceptance check
+      ansible.builtin.assert:
+        that: (acceptance.stdout | from_json).ok
+        fail_msg: "Failed: {{ (acceptance.stdout | from_json).checks | rejectattr('ok') | map(attribute='name') | list }}"
